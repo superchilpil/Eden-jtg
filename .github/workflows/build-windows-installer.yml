@@ -1,0 +1,127 @@
+name: Build Windows Installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: .\tools\windows\install-vulkan-sdk.ps1
+
+      - name: Load MSVC environment
+        shell: pwsh
+        run: .\tools\windows\load-msvc-env.ps1
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DYUZU_TESTS=OFF `
+            -DYUZU_USE_BUNDLED_QT=ON
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --parallel
+
+      - name: Verify executable
+        shell: pwsh
+        run: |
+          if (!(Test-Path "build\bin\eden.exe")) {
+            Write-Error "Eden executable was not produced at build\bin\eden.exe"
+            exit 1
+          }
+
+      - name: Prepare installer files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+          Copy-Item -Path "build\bin\*" -Destination "staging" -Recurse -Force
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Determine version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $version = "${{ github.ref_name }}".TrimStart("v")
+          } else {
+            $version = "0.0.0-${{ github.sha }}".Substring(0, 14)
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Create installer script
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $numericVersion = "0.0.0.0"
+          if ($version -match '^\d+\.\d+\.\d+(\.\d+)?$') {
+            $parts = $version.Split('.')
+            while ($parts.Count -lt 4) { $parts += "0" }
+            $numericVersion = "$($parts[0]).$($parts[1]).$($parts[2]).$($parts[3])"
+          }
+          @"
+          [Setup]
+          AppId={{8E2B2B5C-7B54-4A4E-9A9B-EDENJTG2026}}
+          AppName=Eden JTG
+          AppVersion=$numericVersion
+          AppPublisher=Jack The Gooner
+          DefaultDirName={autopf}\Eden JTG
+          DefaultGroupName=Eden JTG
+          UninstallDisplayIcon={app}\eden.exe
+          ArchitecturesInstallIn64BitMode=x64compatible
+          Compression=lzma2
+          SolidCompression=yes
+          OutputDir=installer
+          OutputBaseFilename=Eden-JTG-$version-Windows-x64
+
+          [Files]
+          Source: "staging\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+
+          [Icons]
+          Name: "{group}\Eden JTG"; Filename: "{app}\eden.exe"
+          Name: "{autodesktop}\Eden JTG"; Filename: "{app}\eden.exe"
+
+          [Run]
+          Filename: "{app}\eden.exe"; Description: "Launch Eden JTG"; Flags: nowait postinstall skipifsilent
+          "@ | Set-Content -Path installer.iss -Encoding UTF8
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path installer | Out-Null
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer.iss
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Eden-JTG-Windows-Installer
+          path: installer/*.exe
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $installer = Get-ChildItem "installer\*.exe" | Select-Object -First 1
+          gh release create "${{ github.ref_name }}" "$($installer.FullName)" --title "Eden JTG ${{ github.ref_name }}" --generate-notes
